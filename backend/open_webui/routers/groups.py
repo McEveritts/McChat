@@ -352,6 +352,7 @@ async def delete_group_by_id(
 
 @router.get('/id/{id}/preview')
 async def preview_group_access(
+    request: Request,
     id: str,
     user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
@@ -368,6 +369,12 @@ async def preview_group_access(
 
     # Batch-check accessible resources using existing AccessGrants
     all_models = await Models.get_all_models(db=db)
+    from open_webui.routers.models import _filter_subscription_model_records, _references_subscription_model
+    model_registry = dict(getattr(request.app.state, 'MODELS', {}).items())
+    private_model_ids = {model.id for model in all_models
+        if _references_subscription_model(request, model, model_registry)}
+    # Personal subscription access cannot be granted to a group.
+    all_models = await _filter_subscription_model_records(request, user, all_models, owner=False, registry=model_registry)
     accessible_model_ids = await AccessGrants.get_accessible_resource_ids(
         user_id='',
         resource_type='model',
@@ -415,11 +422,17 @@ async def preview_group_access(
             model.strip() for model in (await Config.get('ui.default_models') or '').split(',') if model.strip()
         ]
 
+    def public_default_models(values):
+        if values is None:
+            return None
+        return [mid for mid in values if mid not in private_model_ids
+            and not _references_subscription_model(request, {'id': mid}, model_registry)]
+
     return {
         'group': {'id': group.id, 'name': group.name},
         'default_models': {
-            'local': group_default_models(group),
-            'effective': default_models,
+            'local': public_default_models(group_default_models(group)),
+            'effective': public_default_models(default_models),
             'source_group_id': source_group_id,
         },
         'models': {

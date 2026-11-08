@@ -1151,6 +1151,7 @@ async def get_user_groups_by_id(
 
 @router.get('/{user_id}/preview')
 async def get_user_preview(
+    request: Request,
     user_id: str,
     user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
@@ -1168,6 +1169,10 @@ async def get_user_preview(
     user_group_ids = {g.id for g in user_groups}
 
     all_models = await Models.get_all_models(db=db)
+    from open_webui.routers.models import _filter_subscription_model_records
+    from open_webui.subscriptions.routing import is_subscription_owner
+    all_models = await _filter_subscription_model_records(
+        request, user, all_models, owner=user.id == user_id and await is_subscription_owner(user))
     active_models = [m for m in all_models if m.is_active]
     owned_model_ids = {m.id for m in active_models if m.user_id == user_id}
     granted_model_ids = await AccessGrants.get_accessible_resource_ids(

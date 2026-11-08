@@ -25,6 +25,7 @@ API_CONFIG_KEYS = ('openai.api_configs', 'ollama.api_configs')
 DICT_CONFIG_KEY_ALIASES = {
     'openai.api_configs': ('OPENAI_API_CONFIGS',),
     'ollama.api_configs': ('OLLAMA_API_CONFIGS',),
+    'subscriptions.providers': ('SUBSCRIPTIONS_PROVIDERS',),
     'rag.mineru_params': ('MINERU_PARAMS',),
     'rag.docling_params': ('DOCLING_PARAMS',),
     'rag.mistral_ocr_params': ('MISTRAL_OCR_PARAMS',),

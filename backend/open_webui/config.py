@@ -357,6 +357,24 @@ except Exception:
 OPENAI_API_BASE_URL = 'https://api.openai.com/v1'
 
 
+# SUBSCRIPTION_PROVIDERS (Bring Your Own Subscription - BYOS CLI harnesses)
+import copy
+from open_webui.subscriptions.config import DEFAULT_PROVIDERS_CONFIG
+
+ENABLE_SUBSCRIPTIONS = os.getenv('ENABLE_SUBSCRIPTIONS', 'False').lower() == 'true'
+SUBSCRIPTIONS_OWNER_ID = os.getenv('SUBSCRIPTIONS_OWNER_ID', '')
+SUBSCRIPTIONS_REQUEST_TIMEOUT = int(os.getenv('SUBSCRIPTIONS_REQUEST_TIMEOUT', '180'))
+SUBSCRIPTIONS_PROVIDERS = copy.deepcopy(DEFAULT_PROVIDERS_CONFIG)
+_subscriptions_providers_env = os.getenv('SUBSCRIPTIONS_PROVIDERS', '')
+if _subscriptions_providers_env:
+    try:
+        parsed_sub = JSONCodec.loads(_subscriptions_providers_env)
+        if isinstance(parsed_sub, dict):
+            SUBSCRIPTIONS_PROVIDERS.update(parsed_sub)
+    except Exception as e:
+        log.warning('SUBSCRIPTIONS_PROVIDERS is not valid JSON, ignoring: %s', e)
+
+
 # Models
 
 ENABLE_BASE_MODELS_CACHE = os.getenv('ENABLE_BASE_MODELS_CACHE', 'False').lower() == 'true'
@@ -2938,6 +2956,10 @@ DEFAULT_CONFIG = {
     'openai.api_keys': OPENAI_API_KEYS,
     'openai.api_base_urls': OPENAI_API_BASE_URLS,
     'openai.api_configs': OPENAI_API_CONFIGS,
+    'subscriptions.enable': ENABLE_SUBSCRIPTIONS,
+    'subscriptions.owner_id': SUBSCRIPTIONS_OWNER_ID,
+    'subscriptions.request_timeout': SUBSCRIPTIONS_REQUEST_TIMEOUT,
+    'subscriptions.providers': SUBSCRIPTIONS_PROVIDERS,
     'models.base_models_cache': ENABLE_BASE_MODELS_CACHE,
     'tool_server.connections': TOOL_SERVER_CONNECTIONS,
     'oauth.client.timeout': OAUTH_CLIENT_TIMEOUT,

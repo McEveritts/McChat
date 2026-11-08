@@ -425,6 +425,11 @@ async def _generate_summary(
     task_model_id = context_compaction_model if context_compaction_model in models else model_id
     if task_model_id not in models:
         raise ValueError('No available model for context compaction')
+    if models[task_model_id].get('owned_by') == 'arena':
+        from open_webui.subscriptions.routing import resolve_arena_model
+        selected_model, task_model_id = await resolve_arena_model(
+            request, models[task_model_id], user, {'model': task_model_id}, {})
+        models = {**dict(models.items()), task_model_id: selected_model}
 
     summary_prompt_template = summary_prompt_template.strip() or DEFAULT_CONTEXT_COMPACTION_PROMPT
     recent_message_prefix = _message_prefix(recent_messages[0])
@@ -461,11 +466,18 @@ async def _generate_summary(
     task_model_params = task_model_params or {
         'max_tokens': models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
     }
+    from open_webui.subscriptions.routing import is_subscription_model
+    if is_subscription_model(models[task_model_id], task_model_id):
+        from open_webui.subscriptions.controls import filter_subscription_defaults
+        task_model_params = filter_subscription_defaults(task_model_params)
 
     metadata = {
         **(request.state.metadata if hasattr(request.state, 'metadata') else {}),
         'task': 'context_compaction',
     }
+    if is_subscription_model(models[task_model_id], task_model_id):
+        from open_webui.subscriptions.tasks import prepare_subscription_task_request
+        request, metadata = prepare_subscription_task_request(request, metadata)
 
     # Replaying the chat request unchanged lets the provider read the history from its prompt cache.
     # A repeated or transformed boundary cannot safely identify the history to discard.

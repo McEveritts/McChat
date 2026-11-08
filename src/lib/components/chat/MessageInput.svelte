@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { TerminalContext } from '$lib/types';
+	import { requestMayUseSubscriptions } from '$lib/utils/subscriptions';
 	import {
 		estimateTokens,
 		estimateMessagesTokens,
@@ -826,6 +827,8 @@
 		| 'image_generation'
 		| 'code_interpreter'
 		| 'terminal'
+		| 'tools'
+		| 'skills'
 		| 'builtin_tools';
 	type ModelCapabilitiesById = Record<string, Partial<Record<ModelCapability, boolean>>>;
 
@@ -838,7 +841,9 @@
 		modelIds: string[],
 		capability: ModelCapability,
 		capabilitiesById: ModelCapabilitiesById
-	) => modelIds.filter((id) => capabilitiesById[id]?.[capability] ?? true);
+	) => requestMayUseSubscriptions(modelIds, $models)
+		? []
+		: modelIds.filter((id) => capabilitiesById[id]?.[capability] ?? true);
 
 	let visionCapableModels = [];
 	$: visionCapableModels = getCapableModelIds(selectedModelIds, 'vision', modelCapabilitiesById);
@@ -896,7 +901,7 @@
 					($settings?.terminalServers ?? []).some((s) => s.url))));
 
 	let canCreateSkill: boolean = false;
-	$: canCreateSkill = selectedModelIds.every(
+	$: canCreateSkill = !requestMayUseSubscriptions(selectedModelIds, $models) && selectedModelIds.every(
 		(id) =>
 			(modelCapabilitiesById[id]?.builtin_tools ?? true) &&
 			($models.find((model) => model.id === id)?.info?.meta?.builtinTools?.skills ?? true)
@@ -907,13 +912,30 @@
 		.map((id) => ($models.find((model) => model.id === id) || {})?.filters ?? [])
 		.reduce((acc, filters) => acc.filter((f1) => filters.some((f2) => f2.id === f1.id)));
 
+	let toolsCapableModels = [];
+	$: toolsCapableModels = getCapableModelIds(
+		selectedModelIds,
+		'tools',
+		modelCapabilitiesById
+	);
+
+	let skillsCapableModels = [];
+	$: skillsCapableModels = getCapableModelIds(
+		selectedModelIds,
+		'skills',
+		modelCapabilitiesById
+	);
+
 	let showToolsButton = false;
-	$: showToolsButton = ($tools ?? []).length > 0 || ($toolServers ?? []).length > 0;
+	$: showToolsButton =
+		toolsCapableModels.length > 0 &&
+		(($tools ?? []).length > 0 || ($toolServers ?? []).length > 0);
 
 	let showSkillsButton = false;
 	$: showSkillsButton =
-		($skills ?? []).some((skill) => skill.is_active) ||
-		($terminalSkills ?? []).some((skill) => skill.is_active);
+		skillsCapableModels.length > 0 &&
+		(($skills ?? []).some((skill) => skill.is_active) ||
+			($terminalSkills ?? []).some((skill) => skill.is_active));
 
 	let showWebSearchButton = false;
 	$: showWebSearchButton =

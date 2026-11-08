@@ -31,10 +31,25 @@ def resource_models():
     )
 
 
+async def _check_subscription_comment_access(resource_id, user, request, resource=None):
+    from open_webui.subscriptions.routing import is_subscription_model, is_subscription_owner
+
+    registry = getattr(getattr(getattr(request, 'app', None), 'state', None), 'MODELS', {})
+    data = resource if isinstance(resource, dict) else {
+        'id': resource_id, 'base_model_id': getattr(resource, 'base_model_id', None)
+    }
+    base_id = data.get('base_model_id') or (data.get('info') or {}).get('base_model_id') or ''
+    if (is_subscription_model(data, resource_id) or is_subscription_model(registry.get(resource_id), resource_id)
+            or is_subscription_model(registry.get(base_id), base_id)):
+        if not await is_subscription_owner(user):
+            raise HTTPException(404, 'Resource not found')
+
+
 async def provider_comment_resource(resource_id, user, request):
     # Unconfigured provider models are visible only to admins, as in the catalog.
     if user.role != 'admin' or request is None:
         raise HTTPException(404, 'Resource not found')
+    await _check_subscription_comment_access(resource_id, user, request)
     providers = getattr(request.app.state, 'BASE_MODELS', [])
     if not providers:
         from open_webui.utils.models import get_all_models
@@ -44,6 +59,7 @@ async def provider_comment_resource(resource_id, user, request):
     provider = next((item for item in providers if item.get('id') == resource_id), None)
     if provider is None:
         raise HTTPException(404, 'Resource not found')
+    await _check_subscription_comment_access(resource_id, user, request, provider)
     return SimpleNamespace(id=resource_id, name=provider.get('name') or resource_id, user_id=None)
 
 
@@ -59,6 +75,8 @@ async def comment_resource(resource_type, resource_id, user, db, *, lock=False, 
         if resource_type == 'model':
             return await provider_comment_resource(resource_id, user, request)
         raise HTTPException(404, 'Resource not found')
+    if resource_type == 'model':
+        await _check_subscription_comment_access(resource_id, user, request, resource)
     allowed = resource.user_id == user.id
     if resource_type == 'chat':
         from open_webui.models.chats import Chats

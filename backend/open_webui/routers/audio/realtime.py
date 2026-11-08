@@ -407,6 +407,9 @@ async def realtime_call(ws: WebSocket):
         model = ws.app.state.MODELS.get(model_id)
         if not model or model.get('direct'):
             raise ValueError('Bridge requires a server-configured chat model')
+        from open_webui.subscriptions.routing import is_subscription_model
+        if is_subscription_model(model, model_id):
+            raise ValueError('Subscription provider connections do not support realtime audio.')
         model_info = await Models.get_model_by_id(model_id)
         if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
             try:

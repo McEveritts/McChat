@@ -134,6 +134,63 @@ def is_valid_model_id(model_id: str) -> bool:
     return model_id and len(model_id) <= 256 and not any(char.isspace() for char in model_id)
 
 
+def _references_subscription_model(request, value, registry=None):
+    from open_webui.subscriptions.routing import is_subscription_model
+
+    if value is None:
+        return False
+    data = value if isinstance(value, dict) else {
+        key: getattr(value, key, None) for key in ('id', 'base_model_id', 'owned_by', 'info', 'snapshot', 'model_id')
+    }
+    if registry is None:
+        registry = getattr(getattr(getattr(request, 'app', None), 'state', None), 'MODELS', {})
+    candidates = [data]
+    if isinstance(data.get('snapshot'), dict):
+        candidates.append({**data['snapshot'], 'id': data.get('model_id') or data['snapshot'].get('id') or data.get('id')})
+    for data in candidates:
+        model_id = data.get('id') or ''
+        base_id = data.get('base_model_id') or ''
+        if (is_subscription_model(data) or is_subscription_model(registry.get(model_id), model_id)
+                or is_subscription_model(registry.get(base_id), base_id)):
+            return True
+    return False
+
+
+async def _check_subscription_model_config_access(request, user, model_data, previous=None):
+    from open_webui.subscriptions.routing import is_subscription_owner
+
+    if any(_references_subscription_model(request, value) for value in (model_data, previous)):
+        if not await is_subscription_owner(user):
+            raise HTTPException(403, 'Only the subscription account owner can access subscription model configuration.')
+
+
+async def _filter_subscription_model_records(request, user, records, owner=None, registry=None):
+    from open_webui.subscriptions.routing import is_subscription_owner
+
+    if registry is None:
+        pool = getattr(getattr(getattr(request, 'app', None), 'state', None), 'MODELS', {})
+        registry = dict(pool.items())
+    protected = [_references_subscription_model(request, record, registry) for record in records]
+    if not any(protected):
+        return records
+    if owner is None:
+        owner = await is_subscription_owner(user)
+    return records if owner else [record for record, private in zip(records, protected) if not private]
+
+
+async def _subscription_model_tag_filter(request, user):
+    from open_webui.subscriptions.routing import is_subscription_owner
+
+    if await is_subscription_owner(user):
+        return {}
+    registry = dict(getattr(request.app.state, 'MODELS', {}).items())
+    return {
+        'exclude_subscription_models': True,
+        'excluded_model_ids': [mid for mid, model in registry.items()
+            if _references_subscription_model(request, model, registry)],
+    }
+
+
 async def _verify_background_image(url: str | None, user, db, previous_url: str | None = None) -> None:
     if not url or url == previous_url:
         return
@@ -226,6 +283,7 @@ PAGE_ITEM_COUNT = 30
     response_model_exclude={'items': {'__all__': {'meta': {'profile_image_url'}}}},
 )  # do NOT use "/" as path, conflicts with main.py
 async def get_models(
+    request: Request,
     query: str | None = None,
     view_option: str | None = None,
     tag: str | None = None,
@@ -262,7 +320,15 @@ async def get_models(
 
         filter['user_id'] = user.id
 
+    from open_webui.subscriptions.routing import is_subscription_owner
+    owner = await is_subscription_owner(user)
+    registry = dict(getattr(request.app.state, 'MODELS', {}).items())
+    if not owner:
+        filter['exclude_subscription_models'] = True
+        filter['excluded_model_ids'] = [mid for mid, model in registry.items()
+            if _references_subscription_model(request, model, registry)]
     result = await Models.search_models(user.id, filter=filter, skip=skip, limit=limit, db=db)
+    result.items = await _filter_subscription_model_records(request, user, result.items, owner, registry)
 
     # Batch-fetch writable model IDs in a single query instead of N has_access calls
     model_ids = [model.id for model in result.items]
@@ -302,34 +368,37 @@ async def get_models(
 
 
 @router.get('/all', response_model=list[ModelResponse])
-async def get_all_model_records(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
-    return await Models.get_all_models(db=db)
+async def get_all_model_records(request: Request, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
+    return await _filter_subscription_model_records(request, user, await Models.get_all_models(db=db))
 
 
 @router.get('/base/tags', response_model=list[str])
-async def get_base_model_tags(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
-    tags = await Models.get_all_tags(user_id=user.id, is_admin=True, is_base_model=True, db=db)
+async def get_base_model_tags(request: Request, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
+    tags = await Models.get_all_tags(user_id=user.id, is_admin=True, is_base_model=True, db=db,
+        **(await _subscription_model_tag_filter(request, user)))
     return sorted(tags)
 
 
 @router.get('/base', response_model=list[ModelResponse])
 async def get_base_models(
+    request: Request,
     tag: str | None = None,
     user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    return await Models.get_base_models(tag=tag, db=db)
+    return await _filter_subscription_model_records(request, user, await Models.get_base_models(tag=tag, db=db))
 
 
 # Get Model Tags
 
 
 @router.get('/tags', response_model=list[str])
-async def get_model_tags(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+async def get_model_tags(request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
     tags = await Models.get_all_tags(
         user_id=user.id,
         is_admin=(user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL),
         db=db,
+        **(await _subscription_model_tag_filter(request, user)),
     )
     return sorted(tags)
 
@@ -361,6 +430,8 @@ async def create_new_model(
     if form_data.base_model_id == form_data.id:
         # Should never be stored: a model cannot be based on itself.
         form_data.base_model_id = None
+
+    await _check_subscription_model_config_access(request, user, form_data)
 
     model = await Models.get_model_by_id(form_data.id, db=db)
     if model:
@@ -455,6 +526,7 @@ async def export_models(
         models = await Models.get_models(db=db, ids=ids)
     else:
         models = await Models.get_models(writable_by_user_id=user.id, db=db, ids=ids)
+    models = await _filter_subscription_model_records(request, user, models)
     if ids is not None:
         requested = set(ids)
         if requested != {model.id for model in models}:
@@ -520,6 +592,11 @@ async def import_models(
             existing_models = {
                 model.id: model for model in (await Models.get_models_by_ids(model_ids, db=db) if model_ids else [])
             }
+            # Validate the full import before the first model or resource write.
+            for model_data in data:
+                await _check_subscription_model_config_access(
+                    request, user, model_data, existing_models.get(model_data.get('id'))
+                )
 
             # Batch-resolve write permissions in one query instead of
             # per-model has_access calls (N+1 avoidance).
@@ -737,7 +814,12 @@ async def sync_models(
     user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    existing = {model.id: model for model in await Models.get_models_by_ids([m.id for m in form_data.models], db=db)}
+    existing = {model.id: model for model in await Models.get_all_models(db=db)}
+    # Sync also deletes omitted entries, so protect those before any writes.
+    for model in existing.values():
+        await _check_subscription_model_config_access(request, user, model)
+    for model in form_data.models:
+        await _check_subscription_model_config_access(request, user, model, existing.get(model.id))
     for model in form_data.models:
         previous = existing.get(model.id)
         await _check_model_controls(model, previous, user, request)
@@ -769,9 +851,10 @@ class ModelIdForm(BaseModel):
 
 # Note: We're not using the typical url path param here, but instead using a query parameter to allow '/' in the id
 @router.get('/model', response_model=ModelAccessResponse | None)
-async def get_model_by_id(id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+async def get_model_by_id(request: Request, id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
     model = await Models.get_model_by_id(id, db=db)
     if model:
+        await _check_subscription_model_config_access(request, user, model)
         write_access = (
             (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
             or user.id == model.user_id
@@ -820,10 +903,11 @@ async def get_model_by_id(id: str, user=Depends(get_verified_user), db: AsyncSes
 # Get Model By Id
 
 
-async def authorized_model_history(id, user, db):
+async def authorized_model_history(id, user, db, request=None):
     model = await Models.get_model_by_id(id, db=db)
     if not model:
         raise HTTPException(404, ERROR_MESSAGES.NOT_FOUND)
+    await _check_subscription_model_config_access(request, user, model)
     if not (
         user.id == model.user_id
         or (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
@@ -837,37 +921,46 @@ async def authorized_model_history(id, user, db):
 
 @router.get('/model/history', response_model=list[ModelHistoryResponse])
 async def get_model_history(
+    request: Request,
     id: str,
     page: int = 1,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await authorized_model_history(id, user, db)
-    return await ModelHistories.get_history_by_model_id(id, page, db=db)
+    await authorized_model_history(id, user, db, request=request)
+    return await _filter_subscription_model_records(
+        request, user, await ModelHistories.get_history_by_model_id(id, page, db=db))
 
 
 @router.get('/model/history/{history_id}', response_model=ModelHistoryModel)
 async def get_model_history_entry(
+    request: Request,
     id: str,
     history_id: str,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await authorized_model_history(id, user, db)
+    await authorized_model_history(id, user, db, request=request)
     entry = await ModelHistories.get_history_by_id(id, history_id, db=db)
     if not entry:
         raise HTTPException(404, 'Model version not found')
+    await _check_subscription_model_config_access(request, user, entry)
     return entry
 
 
 @router.delete('/model/history/{history_id}', response_model=bool)
 async def delete_model_history_entry(
+    request: Request,
     id: str,
     history_id: str,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await authorized_model_history(id, user, db)
+    await authorized_model_history(id, user, db, request=request)
+    entry = await ModelHistories.get_history_by_id(id, history_id, db=db)
+    if not entry:
+        raise HTTPException(404, 'Model version not found')
+    await _check_subscription_model_config_access(request, user, entry)
     if not await ModelHistories.delete_history_entry(id, history_id, db):
         raise HTTPException(404, 'Model version not found')
     return True
@@ -890,6 +983,7 @@ async def _verify_version_dependencies(request, form, user, db):
             ):
                 raise HTTPException(403, f'Referenced {resource_type} is not accessible: {resource_id}')
 
+    await _check_subscription_model_config_access(request, user, form)
     if form.base_model_id:
         available = await get_all_models(request, user=user)
         if not any(model['id'] == form.base_model_id for model in available):
@@ -934,11 +1028,12 @@ async def set_model_version(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    model = await authorized_model_history(id, user, db)
+    model = await authorized_model_history(id, user, db, request=request)
     entry = await ModelHistories.get_history_by_id(id, form_data.version_id, db=db)
     if not entry:
         raise HTTPException(404, 'Model version not found')
     form = ModelForm(id=id, **deepcopy(entry.snapshot))
+    await _check_subscription_model_config_access(request, user, form, model)
     # A missing historical controls key means an empty configuration, not "preserve current".
     form.params.model_fields_set.add('model_controls')
     if user.role != 'admin' and model.base_model_id and not form.base_model_id:
@@ -969,6 +1064,13 @@ async def get_model_profile_image(
 ):
     profile_image_url = None
     updated_at = None
+
+    from open_webui.subscriptions.routing import is_subscription_owner
+    if not await is_subscription_owner(user):
+        record = await Models.get_model_by_id(id, db=db)
+        registry = dict(getattr(request.app.state, 'MODELS', {}).items())
+        if _references_subscription_model(request, record or {'id': id}, registry):
+            return RedirectResponse(url='/static/favicon.png', status_code=status.HTTP_302_FOUND)
 
     bypass_access_control = BYPASS_MODEL_ACCESS_CONTROL or (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
 
@@ -1073,6 +1175,7 @@ async def toggle_model_by_id(
 ):
     model = await Models.get_model_by_id(id, db=db)
     if model:
+        await _check_subscription_model_config_access(request, user, model)
         if (
             user.role == 'admin'
             or model.user_id == user.id
@@ -1159,6 +1262,8 @@ async def update_model_by_id(
         # Should never be stored: a model cannot be based on itself.
         form_data.base_model_id = None
 
+    await _check_subscription_model_config_access(request, user, form_data, model)
+
     if user.role != 'admin' and model.base_model_id and not form_data.base_model_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1205,6 +1310,7 @@ async def update_model_access_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     model = await Models.get_model_by_id(form_data.id, db=db)
+    await _check_subscription_model_config_access(request, user, {'id': form_data.id}, model)
 
     # Non-preset models (e.g. direct Ollama/OpenAI models) may not have a DB
     # entry yet. Create a minimal one so access grants can be stored.
@@ -1301,6 +1407,7 @@ async def delete_model_by_id(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
+    await _check_subscription_model_config_access(request, user, model)
     result = await Models.delete_model_by_id(form_data.id, db=db)
     if result:
         await publish_event(
@@ -1317,6 +1424,8 @@ async def delete_model_by_id(
 async def delete_all_models(
     request: Request, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
 ):
+    for model in await Models.get_all_models(db=db):
+        await _check_subscription_model_config_access(request, user, model)
     result = await Models.delete_all_models(db=db)
     if result:
         await publish_event(request, EVENTS.MODEL_DELETED, actor=user, subject_type='model')

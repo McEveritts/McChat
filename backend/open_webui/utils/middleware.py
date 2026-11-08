@@ -2065,37 +2065,38 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # processing (knowledge, capabilities, tools, params) uses its settings
     # instead of the empty arena wrapper.
     if model.get('owned_by') == 'arena':
-        arena_model_ids = model.get('info', {}).get('meta', {}).get('model_ids')
-        arena_filter_mode = model.get('info', {}).get('meta', {}).get('filter_mode')
-        if arena_model_ids and arena_filter_mode == 'exclude':
-            arena_model_ids = [
-                available_model['id']
-                for available_model in request.app.state.MODELS.values()
-                if available_model.get('owned_by') != 'arena' and available_model['id'] not in arena_model_ids
-            ]
+        from open_webui.subscriptions.routing import resolve_arena_model
+        model, selected_model_id = await resolve_arena_model(request, model, user, form_data, metadata)
 
-        if isinstance(arena_model_ids, list) and arena_model_ids:
-            selected_model_id = random.choice(arena_model_ids)
-        else:
-            arena_model_ids = [
-                available_model['id']
-                for available_model in request.app.state.MODELS.values()
-                if available_model.get('owned_by') != 'arena'
-            ]
-            selected_model_id = random.choice(arena_model_ids)
 
-        selected_model = request.app.state.MODELS.get(selected_model_id)
-        if selected_model:
-            model = selected_model
-            form_data['model'] = selected_model_id
-            metadata['selected_model_id'] = selected_model_id
+    from open_webui.subscriptions.routing import is_subscription_model
+    from open_webui.subscriptions.security import validate_chat_request_security
+    subscription_request = is_subscription_model(model, form_data.get('model', ''))
+
+    def validate_subscription_effective_payload():
+        nonlocal subscription_request
+        effective_model_id = form_data.get('model', '')
+        models_state = getattr(request.app.state, 'MODELS', None)
+        effective_model = models_state.get(effective_model_id) if models_state is not None else None
+        subscription_request = subscription_request or is_subscription_model(
+            effective_model or model, effective_model_id
+        )
+        if subscription_request:
+            # Saved histories are reconstructed below; inspect partial inputs before IO.
+            validate_chat_request_security(
+                form_data, metadata=metadata, request=request, require_complete_messages=False
+            )
+
+    validate_subscription_effective_payload()
 
     # Keep the template before apply_params_to_form_data consumes the model parameters.
     model_system_prompt_template = (form_data.get('params') or {}).get('system')
 
     payload_tools = form_data.get('tools', None)  # snapshot before filters
     form_data = apply_params_to_form_data(form_data, model)
-    log.debug('form_data: %s', form_data)
+    validate_subscription_effective_payload()
+    if not subscription_request:
+        log.debug('form_data: %s', form_data)
 
     # Guided regeneration: extract before it reaches the LLM provider
     regeneration_prompt = form_data.pop('regeneration_prompt', None)
@@ -2112,6 +2113,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         and metadata.get('params', {}).get('function_calling') != 'legacy'
         and (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get('builtin_tools', True)
     )
+    if subscription_request:
+        use_builtin_tools = False
+
     metadata['include_file_context'] = bool(
         chat and chat.user_id == user.id and payload_tools is None and use_builtin_tools
     )
@@ -2174,6 +2178,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                 if f.get('url')
                             ],
                         ]
+
+    # Saved history may contain media or tools absent from the current UI turn.
+    # Reject it before prompt expansion, image retrieval or feature setup.
+    validate_subscription_effective_payload()
 
     if regeneration_prompt:
         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
@@ -2380,6 +2388,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             )
         except Exception as e:
             raise Exception(f'{e}')
+
+    validate_subscription_effective_payload()
+    if subscription_request:
+        use_builtin_tools = False
+        metadata['include_file_context'] = False
 
     features = form_data.pop('features', None) or {}
     extra_params['__features__'] = features
@@ -2916,7 +2929,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     log.exception(e)
 
     # Check if file context extraction is enabled for this model (default True)
-    file_context_enabled = (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get('file_context', True)
+    file_context_enabled = not subscription_request and (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get('file_context', True)
 
     if file_context_enabled:
         try:
@@ -2995,6 +3008,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             )
         except Exception as e:
             raise Exception(f'{e}')
+
+    validate_subscription_effective_payload()
 
     form_data = normalize_messages_for_model(form_data)
 
@@ -4198,6 +4213,8 @@ async def streaming_chat_response_handler(response, ctx):
             tag_scan_positions = {}
             tag_boundary_positions = {}
             response_stream_task_id = metadata.get('task_id') or metadata.get('message_id')
+            stream_failed = False
+            stream_error_payload = None
 
             def tag_output_handler(content_type, tags, output):
                 """
@@ -4679,6 +4696,7 @@ async def streaming_chat_response_handler(response, ctx):
                         )
 
                 async def stream_body_handler(response, current_form_data):
+                    nonlocal stream_failed, stream_error_payload
                     nonlocal usage
                     nonlocal current_usage
                     nonlocal finish_reason
@@ -4970,7 +4988,10 @@ async def streaming_chat_response_handler(response, ctx):
                                     if not choices:
                                         error = data.get('error', {})
                                         if error:
+                                            stream_failed = True
+                                            stream_error_payload = error
                                             log.error('Provider returned error (streaming): %s', error)
+
                                             if save_to_chat:
                                                 try:
                                                     await Chats.upsert_message_to_chat_by_id_and_message_id(
@@ -6335,6 +6356,46 @@ async def streaming_chat_response_handler(response, ctx):
                             log.exception('Code interpreter continuation failed: %s', error_content)
                             await emit_message_error(error_content)
                             break
+
+                if stream_failed:
+                    from open_webui.subscriptions.routing import is_subscription_model
+                    target_mid = form_data.get('model', '') if isinstance(form_data, dict) else ''
+                    if is_subscription_model(model, target_mid):
+                        if hasattr(response, 'body_iterator') and hasattr(response.body_iterator, 'aclose'):
+                            try:
+                                await asyncio.shield(response.body_iterator.aclose())
+                            except Exception:
+                                pass
+                        current_output = full_output()
+                        if save_to_chat:
+                            try:
+                                await Chats.upsert_message_to_chat_by_id_and_message_id(
+                                    metadata['chat_id'],
+                                    metadata['message_id'],
+                                    {
+                                        'done': False,
+                                        'failed': True,
+                                        'error': {'content': stream_error_payload},
+                                        'output': current_output,
+                                        'meta': {'response_ended_at': time.time()},
+                                    },
+                                )
+                            except Exception:
+                                pass
+                        await clear_response_stream(request.app.state.redis, response_stream_task_id)
+                        await event_emitter(
+                            {
+                                'type': 'chat:completion',
+                                'data': {
+                                    'done': False,
+                                    'failed': True,
+                                    'error': stream_error_payload,
+                                    'output': current_output,
+                                },
+                            }
+                        )
+                        await publish_chat_failed_event(request, user, metadata, str(stream_error_payload))
+                        return
 
                 # Mark all in-progress items as completed
                 for item in [*prior_output, *output]:

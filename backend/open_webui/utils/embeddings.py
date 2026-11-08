@@ -65,6 +65,15 @@ async def generate_embeddings(
         raise Exception('Model not found')
     model = models[model_id]
 
+    from open_webui.subscriptions.routing import is_subscription_model
+    if is_subscription_model(model, model_id):
+        from fastapi import HTTPException, status
+        await check_model_access(user, model)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Subscription provider connections do not support embeddings.',
+        )
+
     # Access filtering
     if not getattr(request.state, 'direct', False):
         if not bypass_filter and user.role == 'user':

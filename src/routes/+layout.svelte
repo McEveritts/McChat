@@ -580,6 +580,20 @@
 
 	const chatEventHandler = async (event, cb) => {
 		if (event.shared) return;
+		if (event?.data?.type === 'models:refresh') {
+			const token = localStorage.token;
+			if (token) {
+				models.set(
+					await getModels(
+						token,
+						$config?.features?.enable_direct_connections
+							? ($settings?.directConnections ?? null)
+							: null
+					)
+				);
+			}
+			return;
+		}
 		const chat = $page.url.pathname.includes(`/c/${event.chat_id}`);
 
 		// Skip events from temporary chats that are not the current chat.

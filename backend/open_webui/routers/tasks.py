@@ -20,7 +20,7 @@ from open_webui.constants import ERROR_MESSAGES, TASKS
 from open_webui.models.config import Config
 from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.chat import generate_chat_completion as _generate_task_completion
 from open_webui.utils.payload import apply_params_to_form_data
 from open_webui.utils.task import (
     autocomplete_generation_template,
@@ -71,8 +71,34 @@ def config_updates(data: dict, key_map: dict[str, str]) -> dict:
     return {key_map[field]: value for field, value in data.items() if field in key_map}
 
 
+from open_webui.subscriptions.routing import is_subscription_model
+
+
+async def generate_chat_completion(request: Request, form_data: dict, user, **kwargs):
+    model_id = form_data.get('model', '')
+    model = request.app.state.MODELS.get(model_id)
+    if model and model.get('owned_by') == 'arena':
+        import copy
+        from open_webui.subscriptions.routing import resolve_arena_model
+        form_data = copy.deepcopy(form_data)
+        metadata = form_data.setdefault('metadata', {})
+        model, model_id = await resolve_arena_model(request, model, user, form_data, metadata)
+    if is_subscription_model(model, model_id):
+        from open_webui.subscriptions.controls import filter_subscription_defaults
+        from open_webui.subscriptions.tasks import prepare_subscription_task_request
+        form_data = filter_subscription_defaults(form_data)
+        request, metadata = prepare_subscription_task_request(request, form_data.get('metadata') or {})
+        form_data = {**form_data, 'metadata': metadata}
+    return await _generate_task_completion(request, form_data=form_data, user=user, **kwargs)
+
+
 def apply_task_model_params(payload: dict, models: dict, task_model_id: str, params: dict | None = None) -> dict:
     model = models.get(payload.get('model')) or models.get(task_model_id)
+    if is_subscription_model(model, task_model_id):
+        from open_webui.subscriptions.controls import filter_subscription_defaults
+        payload = filter_subscription_defaults(payload)
+        if params and isinstance(params, dict):
+            params = filter_subscription_defaults(params)
     if not model or (not params and not payload.get('params')):
         return payload
     return apply_params_to_form_data(payload, model, params or None)
@@ -177,9 +203,13 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         template = DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE
 
     content = await title_generation_template(template, form_data['messages'], user)
-    task_model_params = task_model_params or {
-        'max_tokens': models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
-    }
+    if is_subscription_model(models.get(task_model_id), task_model_id):
+        from open_webui.subscriptions.controls import filter_subscription_defaults
+        task_model_params = filter_subscription_defaults(task_model_params)
+    else:
+        task_model_params = task_model_params or {
+            'max_tokens': models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
+        }
 
     payload = {
         'model': task_model_id,
@@ -598,7 +628,8 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
     except Exception as e:
         raise e
 
-    payload = apply_task_model_params(payload, models, task_model_id, {'max_tokens': 4})
+    emoji_params = {} if is_subscription_model(models.get(task_model_id), task_model_id) else {'max_tokens': 4}
+    payload = apply_task_model_params(payload, models, task_model_id, emoji_params)
 
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)

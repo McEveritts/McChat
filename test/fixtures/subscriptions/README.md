@@ -1,0 +1,1 @@
+The Antigravity 1.4.5 initialize transcript was captured from Google's official runtime with a new temporary profile and McChat client identity. Only initialize was sent; it contains no account, authentication, session, or prompt data. Tests replay this recorded response without launching a provider.

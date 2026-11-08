@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { TerminalContext } from '$lib/types';
+	import { requestMayUseSubscriptions } from '$lib/utils/subscriptions';
 	import {
 		estimateTokens,
 		estimateMessagesTokens,
@@ -1121,27 +1122,33 @@
 				featureAvailable(feature) &&
 				currentModels.every((model) => model.info?.meta?.defaultFeatureIds?.includes(feature));
 			const terminalId = currentModels[0]?.info?.meta?.terminalId;
+			const toolsSupported = supports('tools');
+			const skillsSupported = supports('skills');
 			const defaults: Record<string, any> = {
-				selectedToolIds: [
-					...new Set(
-						currentModels.flatMap(
-							(model) =>
-								model.info?.meta?.toolIds?.filter(
-									(id: string) =>
-										selectedToolIds.includes(id) || ($tools as any[]).some((tool) => tool.id === id)
-								) ??
-								($settings as any)?.tools ??
-								[]
+				selectedToolIds: toolsSupported
+					? [
+						...new Set(
+							currentModels.flatMap(
+								(model) =>
+									model.info?.meta?.toolIds?.filter(
+										(id: string) =>
+											selectedToolIds.includes(id) || ($tools as any[]).some((tool) => tool.id === id)
+									) ??
+									($settings as any)?.tools ??
+									[]
+							)
 						)
+					]
+					: [],
+				selectedSkillIds: skillsSupported
+					? [
+						...new Set(currentModels.flatMap((model) => model.info?.meta?.skillIds ?? []))
+					].filter(
+						(id) =>
+							selectedSkillIds.includes(id) ||
+							$skills.some((skill) => skill.id === id && skill.is_active)
 					)
-				],
-				selectedSkillIds: [
-					...new Set(currentModels.flatMap((model) => model.info?.meta?.skillIds ?? []))
-				].filter(
-					(id) =>
-						selectedSkillIds.includes(id) ||
-						$skills.some((skill) => skill.id === id && skill.is_active)
-				),
+					: [],
 				selectedFilterIds: [
 					...new Set(currentModels.flatMap((model) => model.info?.meta?.defaultFilterIds ?? []))
 				],
@@ -1203,6 +1210,12 @@
 				defaults.terminalId = null;
 			}
 			if (defaults.terminalId) defaults.codeInterpreterEnabled = false;
+			if (!supports('tools')) {
+				defaults.selectedToolIds = [];
+			}
+			if (!supports('skills')) {
+				defaults.selectedSkillIds = [];
+			}
 			defaultsModelIds = modelIds;
 			({
 				selectedToolIds,
@@ -3605,7 +3618,7 @@
 		history.messages[message.id] = message;
 		history = history;
 
-		if (done) {
+		if (done || data.failed) {
 			message.done = true;
 			if ($contextCompactions[message.id] === 'in_progress') clearContextCompaction(message.id);
 			if (shared) return;
@@ -4277,7 +4290,7 @@
 		};
 	};
 
-	const getFeatures = () => {
+	const getFeatures = (model) => {
 		let features = {};
 
 		if ($config?.features)
@@ -4296,7 +4309,10 @@
 				web_search: webSearchActive
 			};
 
-		if ($settings?.memory ?? $config?.features?.enable_memories ?? false) {
+		if (
+			model?.info?.meta?.capabilities?.memory !== false &&
+			($settings?.memory ?? $config?.features?.enable_memories ?? false)
+		) {
 			features = { ...features, memory: true };
 		}
 
@@ -4483,18 +4499,31 @@
 		const useChatVariablesFallback =
 			!_chatId || $temporaryChatEnabled || isTemporaryChatId(_chatId);
 
+		const isSubscription = requestMayUseSubscriptions(
+			messageIdsList?.map((entry) => entry.model_id) ?? [model.id], $models
+		);
+
 		const res = await generateOpenAIChatCompletion(
 			localStorage.token,
 			{
 				stream: stream,
 				model: model.id,
 				...(messages.length > 0 ? { messages } : {}),
-				params: {
-					...$settings?.params,
-					...Object.fromEntries(Object.entries(params).filter(([, value]) => value !== null)),
-					model_controls: $settings?.params?.model_controls ?? {},
-					stop: getStopTokens()
-				},
+				params: isSubscription
+					? {
+							...(params?.reasoning_effort !== undefined && params?.reasoning_effort !== null
+								? { reasoning_effort: params.reasoning_effort }
+								: $settings?.params?.reasoning_effort !== undefined && $settings?.params?.reasoning_effort !== null
+								? { reasoning_effort: $settings.params.reasoning_effort }
+								: {}),
+							model_controls: $settings?.params?.model_controls ?? {}
+					  }
+					: {
+							...$settings?.params,
+							...Object.fromEntries(Object.entries(params).filter(([, value]) => value !== null)),
+							model_controls: $settings?.params?.model_controls ?? {},
+							stop: getStopTokens()
+					  },
 
 				files: embedded
 					? [...(files ?? []), ...noteFiles]
@@ -4506,14 +4535,16 @@
 					$config?.features?.enable_functions && selectedFilterIds.length > 0
 						? selectedFilterIds
 						: undefined,
-				tool_ids: toolIds.filter((id) =>
-					id.startsWith('server:')
-						? $config?.features?.enable_tool_servers
-						: $config?.features?.enable_tools
-				),
-				skill_ids: skillIds.length > 0 ? skillIds : undefined,
-				terminal_id: terminalEnabled && requestTerminalId ? requestTerminalId : undefined,
-				tool_servers: $config?.features?.enable_tool_servers
+				tool_ids: isSubscription
+					? []
+					: toolIds.filter((id) =>
+						id.startsWith('server:')
+							? $config?.features?.enable_tool_servers
+							: $config?.features?.enable_tools
+					),
+				skill_ids: isSubscription ? undefined : (skillIds.length > 0 ? skillIds : undefined),
+				terminal_id: !isSubscription && terminalEnabled && requestTerminalId ? requestTerminalId : undefined,
+				tool_servers: !isSubscription && $config?.features?.enable_tool_servers
 					? [
 							...($toolServers ?? []).filter(
 								(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
@@ -4529,7 +4560,7 @@
 								: [])
 						]
 					: [],
-				features: getFeatures(),
+				features: isSubscription ? {} : getFeatures(model),
 				variables: {
 					...getPromptVariables(
 						$user?.name,

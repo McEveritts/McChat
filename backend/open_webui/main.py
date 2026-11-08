@@ -5,6 +5,7 @@ import copy
 import logging
 import mimetypes
 import os
+import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -179,6 +180,7 @@ from open_webui.routers import (
     scim,
     search,
     skills,
+    subscriptions,
     tasks,
     terminals,
     tools,
@@ -826,6 +828,7 @@ app.include_router(audio.router, prefix='/api/v1/audio', tags=['audio'])
 app.include_router(retrieval.router, prefix='/api/v1/retrieval', tags=['retrieval'])
 
 app.include_router(configs.router, prefix='/api/v1/configs', tags=['configs'])
+app.include_router(subscriptions.router, prefix='/api/v1/subscriptions', tags=['subscriptions'])
 
 app.include_router(auths.router, prefix='/api/v1/auths', tags=['auths'])
 app.include_router(mfa.router, prefix='/api/v1/auths/mfa', tags=['auths'])
@@ -920,7 +923,7 @@ async def get_models(request: Request, refresh: bool = False, user=Depends(get_v
 @app.get('/api/models/base')
 async def get_base_models(request: Request, user=Depends(get_admin_user)):
     models = await get_all_base_models(request, user=user)
-    return {'data': models}
+    return {'data': await get_filtered_models(models, user)}
 
 
 class ModelUnloadForm(BaseModel):
@@ -1095,10 +1098,13 @@ async def chat_completion(
     tasks = form_data.pop('background_tasks', None)
 
     metadata = {}
+    requested_model_id = model_id
+    primary_arena_selection = None
     try:
         model_info = None
         fallback_model = None
         missing_base_model = False
+        is_sub_model = False
         if not model_item.get('direct', False):
             if model_id not in request.app.state.MODELS:
                 raise Exception('Model not found')
@@ -1121,8 +1127,32 @@ async def chat_completion(
                 if fallback_model_id:
                     fallback_model = request.app.state.MODELS.get(fallback_model_id)
 
-            # Check if user has access to the model
-            if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
+            if model.get('owned_by') == 'arena':
+                if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
+                    await check_model_access(user, model, model_info=model_info)
+                from open_webui.subscriptions.routing import resolve_arena_model
+                model, resolved_arena_id = await resolve_arena_model(request, model, user, form_data, metadata)
+                primary_arena_selection = resolved_arena_id
+                model_id = resolved_arena_id
+                form_data['model'] = resolved_arena_id
+                if metadata is not None:
+                    metadata['selected_model_id'] = resolved_arena_id
+                model_info = await Models.get_model_by_id(model_id)
+                missing_base_model = bool(
+                    model_info and model_info.base_model_id and model_info.base_model_id not in request.app.state.MODELS
+                )
+
+            # Check if user has access to the model; subscription models are ALWAYS checked independently of bypass flags
+            from open_webui.subscriptions.routing import is_subscription_model
+            is_sub_model = is_subscription_model(model, model_id)
+            if is_sub_model:
+                access_model_info = (
+                    model_info.model_copy(update={'base_model_id': None})
+                    if fallback_model is not None and model_info is not None
+                    else model_info
+                )
+                await check_model_access(user, model, model_info=access_model_info)
+            elif not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
                 try:
                     access_model_info = (
                         model_info.model_copy(update={'base_model_id': None})
@@ -1142,11 +1172,17 @@ async def chat_completion(
         model_capabilities = ((model.get('info') or {}).get('meta') or {}).get('capabilities') or {}
 
         # Model params: global defaults as base, per-model overrides win
+        from open_webui.subscriptions.controls import filter_subscription_defaults
+        from open_webui.subscriptions.routing import is_subscription_model
         default_model_params = copy.deepcopy(await Config.get('models.default_params', {}) or {})
+
         model_info_params = merge_model_params(
-            default_model_params,
+            filter_subscription_defaults(default_model_params) if is_sub_model else default_model_params,
             model_info.params.model_dump() if model_info and model_info.params else {},
         )
+        if is_sub_model:
+            model_info_params = filter_subscription_defaults(model_info_params)
+
         model_info_params.pop('model_controls', None)
         request_params = {key: value for key, value in (form_data.get('params') or {}).items() if value is not None}
         model_controls = request_params.pop('model_controls', {})
@@ -1158,6 +1194,7 @@ async def chat_completion(
         if model_info_params or request_params:
             form_data['params'] = merge_model_params(model_info_params, request_params)
 
+
         # Check base model existence for custom models
         if missing_base_model:
             if fallback_model is None:
@@ -1165,6 +1202,11 @@ async def chat_completion(
             # Update model and form_data so routing uses the fallback model's type
             model = fallback_model
             form_data['model'] = fallback_model['id']
+            is_sub_model = is_subscription_model(model, form_data['model'])
+            model_capabilities = ((model.get('info') or {}).get('meta') or {}).get('capabilities') or {}
+            if is_sub_model:
+                model_info_params = filter_subscription_defaults(model_info_params)
+                form_data['params'] = merge_model_params(model_info_params, request_params)
 
         # Chat Params
         stream_delta_chunk_size = form_data.get('params', {}).get('stream_delta_chunk_size')
@@ -1255,6 +1297,7 @@ async def chat_completion(
             if approval_resume and approval_resume[:2] == (chat_id, form_data.get('assistant_message_id'))
             else None,
             'user_id': user.id,
+            **({'selected_model_id': primary_arena_selection} if primary_arena_selection else {}),
             'user_agent': request.headers.get('user-agent', '') or '',
             'internal': getattr(request.state, 'internal', False) is True,
             'chat_id': chat_id,
@@ -1296,6 +1339,49 @@ async def chat_completion(
                 'model_controls': model_controls,
             },
         }
+
+        # Early validation for subscription models before inserting chat turns, files, or background tasks
+        from open_webui.subscriptions.routing import is_subscription_model, resolve_arena_model
+        primary_arena_used = False
+        for entry in (message_ids or []):
+            t_mid = entry.get('model_id')
+            t_model = request.app.state.MODELS.get(t_mid) if t_mid else None
+            if fallback_model is not None and t_mid == model_id:
+                # Use the effective primary selection, including an already
+                # resolved Arena fallback, before any chat persistence.
+                t_model = model
+                t_mid = model['id']
+                entry['model_id'] = t_mid
+            if t_model and t_model.get('owned_by') == 'arena':
+                if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
+                    await check_model_access(user, t_model, model_info=await Models.get_model_by_id(t_mid))
+                if t_mid == requested_model_id and primary_arena_selection and not primary_arena_used:
+                    resolved_arena_id = primary_arena_selection
+                    t_model = request.app.state.MODELS[resolved_arena_id]
+                    primary_arena_used = True
+                else:
+                    t_model, resolved_arena_id = await resolve_arena_model(request, t_model, user, None, None)
+                entry['model_id'] = resolved_arena_id
+                entry['selected_model_id'] = resolved_arena_id
+                t_mid = resolved_arena_id
+            elif t_mid == primary_arena_selection and not primary_arena_used:
+                entry['selected_model_id'] = primary_arena_selection
+                primary_arena_used = True
+
+            if is_subscription_model(t_model, t_mid or ''):
+                await check_model_access(user, t_model, model_info=await Models.get_model_by_id(t_mid))
+
+                from open_webui.subscriptions.security import validate_chat_request_security
+                is_saved_path = bool(
+                    (is_saved_chat_id(metadata.get('chat_id')) or is_new_chat or metadata.get('chat_id'))
+                    and (metadata.get('user_message') or metadata.get('assistant_message_id'))
+                )
+                validate_chat_request_security(
+                    {**form_data, 'params': request_params},
+                    metadata=metadata,
+                    request=request,
+                    require_complete_messages=not is_saved_path,
+                )
 
         if is_new_chat:
             metadata['chat_id'] = str(uuid4())
@@ -1611,12 +1697,38 @@ async def chat_completion(
                         else await Models.get_model_by_id(form_data['model'])
                     )
                     controls = target.params.model_dump().get('model_controls', {}) if target else {}
+                    from open_webui.subscriptions.routing import is_subscription_model
+                    if is_subscription_model(model, form_data['model']):
+                        native_controls = ((model.get('info') or {}).get('params') or {}).get('model_controls', {})
+                        controls = {**native_controls, **controls}
                     form_data['params'] = apply_model_controls(
                         copy.deepcopy(form_data.get('params') or {}),
                         controls,
                         model_controls.get(form_data['model'], {}),
                     )
+                # Arena model resolution fallback (if not already resolved)
+                if model and model.get('owned_by') == 'arena':
+                    from open_webui.subscriptions.routing import resolve_arena_model
+                    model, sel_id = await resolve_arena_model(request, model, user, form_data, metadata)
+
                 ctx = None
+                # Early validation for subscription models before middleware side effects (files/tools/MCP/terminals/skills)
+                from open_webui.subscriptions.routing import is_subscription_model
+                is_sub_model = is_subscription_model(model, form_data.get('model', ''))
+                if is_sub_model:
+                    from open_webui.subscriptions.security import validate_chat_request_security
+                    is_saved_path = bool(
+                        (is_saved_chat_id(metadata.get('chat_id')) or is_new_chat or metadata.get('chat_id'))
+                        and (metadata.get('user_message') or metadata.get('assistant_message_id'))
+                    )
+                    validate_chat_request_security(
+                        form_data,
+                        metadata=metadata,
+                        request=request,
+                        require_complete_messages=not is_saved_path,
+                    )
+
+
                 # Saved chats load the message after approved tool calls run, so their results are kept
                 if metadata.get('assistant_message_id') and not is_saved_chat_id(metadata.get('chat_id')):
                     ctx = await build_chat_response_context(request, form_data, user, model, metadata, tasks, [])
@@ -1794,6 +1906,9 @@ async def chat_completion(
                 'message_id': assistant_message_id,
                 'task_id': str(uuid4()),
             }
+            per_model_metadata.pop('selected_model_id', None)
+            if entry.get('selected_model_id'):
+                per_model_metadata['selected_model_id'] = entry['selected_model_id']
 
             if is_saved_chat_id(chat_id):
                 await Chats.upsert_message_to_chat_by_id_and_message_id(
@@ -1809,11 +1924,36 @@ async def chat_completion(
 
             # Resolve the model object for this specific model
             resolved_model = request.app.state.MODELS.get(target_model_id, model)
+            target_is_subscription = is_subscription_model(resolved_model, target_model_id)
+            if target_is_subscription or is_sub_model:
+                target_info = await Models.get_model_by_id(target_model_id)
+                target_params = target_info.params.model_dump() if target_info and target_info.params else {}
+                model_form_data['params'] = merge_model_params(
+                    merge_model_params(
+                        filter_subscription_defaults(default_model_params) if target_is_subscription else copy.deepcopy(default_model_params),
+                        filter_subscription_defaults(target_params) if target_is_subscription else target_params,
+                    ),
+                    request_params,
+                )
+            per_model_metadata['model'] = resolved_model
+            # Concurrent columns must not share mutable request.state metadata.
+            # Preserve the consumed body and other cached Request attributes.
+            model_request = copy.copy(request)
+            model_request.scope = {
+                **request.scope,
+                'state': {
+                    **request.scope.get('state', {}),
+                    'metadata': per_model_metadata,
+                    'model_id': target_model_id,
+                },
+            }
+            if hasattr(model_request, '_state'):
+                del model_request._state
 
             # Only the first model runs chat-level background tasks;
             # subsequent models only run follow-ups.
             process = process_chat(
-                request,
+                model_request,
                 model_form_data,
                 user,
                 per_model_metadata,
@@ -1866,9 +2006,27 @@ async def chat_completion(
         }
     else:
         # Legacy/direct: single model, synchronous
-        metadata['message_id'] = message_ids[0]['message_id']
+        entry = message_ids[0]
+        target_model_id = entry['model_id']
+        resolved_model = request.app.state.MODELS.get(target_model_id, model)
+        target_is_subscription = is_subscription_model(resolved_model, target_model_id)
+        if target_is_subscription or is_sub_model:
+            target_info = await Models.get_model_by_id(target_model_id)
+            target_params = target_info.params.model_dump() if target_info and target_info.params else {}
+            form_data['params'] = merge_model_params(
+                merge_model_params(
+                    filter_subscription_defaults(default_model_params) if target_is_subscription else copy.deepcopy(default_model_params),
+                    filter_subscription_defaults(target_params) if target_is_subscription else target_params,
+                ),
+                request_params,
+            )
+        form_data['model'] = target_model_id
+        metadata['model'] = resolved_model
+        metadata['message_id'] = entry['message_id']
+        if entry.get('selected_model_id'):
+            metadata['selected_model_id'] = entry['selected_model_id']
         try:
-            return await process_chat(request, form_data, user, metadata, model, tasks)
+            return await process_chat(request, form_data, user, metadata, resolved_model, tasks)
         except HTTPException:
             raise
         except Exception as e:

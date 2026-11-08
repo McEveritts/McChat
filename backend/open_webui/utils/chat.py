@@ -212,7 +212,6 @@ async def generate_chat_completion(
     bypass_filter: bool = False,
     bypass_system_prompt: bool = False,
 ):
-    log.debug('generate_chat_completion: %s', form_data)
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
 
@@ -252,11 +251,23 @@ async def generate_chat_completion(
     if model is None:
         raise Exception('Model not found')
 
+    from open_webui.subscriptions.routing import is_subscription_model
+    if model.get('owned_by') != 'arena' and not is_subscription_model(model, model_id):
+        log.debug('generate_chat_completion: %s', form_data)
+
     if getattr(request.state, 'direct', False) and model_id == getattr(request.state, 'model', {}).get('id'):
         return await generate_direct_chat_completion(request, form_data, user=user, models=models)
     else:
         # Check if user has access to the model
-        if not bypass_filter and user.role == 'user':
+        base_model_id = model.get('base_model_id') or (model.get('info', {}) or {}).get('base_model_id')
+        is_sub_model = bool(
+            model.get('owned_by') == 'subscription'
+            or model_id.startswith('subscription:')
+            or (base_model_id and str(base_model_id).startswith('subscription:'))
+        )
+        if is_sub_model:
+            await check_model_access(user, model)
+        elif not bypass_filter and user.role == 'user':
             try:
                 await check_model_access(user, model)
             except Exception as e:
@@ -275,32 +286,13 @@ async def generate_chat_completion(
         # from a path that did NOT go through process_chat_payload (e.g.,
         # background tasks for title/follow-up/tags generation), resolve now.
         if not selected_model_id and model.get('owned_by') == 'arena':
-            model_ids = model.get('info', {}).get('meta', {}).get('model_ids')
-            filter_mode = model.get('info', {}).get('meta', {}).get('filter_mode')
-            if model_ids and filter_mode == 'exclude':
-                model_ids = [
-                    available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
-                    if available_model.get('owned_by') != 'arena' and available_model['id'] not in model_ids
-                ]
+            from open_webui.subscriptions.routing import resolve_arena_model
+            selected_model, selected_model_id = await resolve_arena_model(
+                request, model, user, form_data, getattr(request.state, 'metadata', None)
+            )
+            if selected_model:
+                await check_model_access(user, selected_model)
 
-            if isinstance(model_ids, list) and model_ids:
-                selected_model_id = random.choice(model_ids)
-            else:
-                model_ids = [
-                    available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
-                    if available_model.get('owned_by') != 'arena'
-                ]
-                selected_model_id = random.choice(model_ids)
-
-            form_data['model'] = selected_model_id
-
-            # bypass_filter recursion below skips the line-200 check; gate the resolved model here.
-            if not bypass_filter and user.role == 'user':
-                selected_model = request.app.state.MODELS.get(selected_model_id)
-                if selected_model:
-                    await check_model_access(user, selected_model)
 
         if selected_model_id:
             if form_data.get('stream') == True:
@@ -340,6 +332,52 @@ async def generate_chat_completion(
         if model.get('pipe'):
             # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter
             return await generate_function_chat_completion(request, form_data, user=user, models=models)
+        base_model_id = model.get('base_model_id') or (model.get('info', {}) or {}).get('base_model_id')
+        if (
+            model.get('owned_by') == 'subscription'
+            or form_data.get('model', '').startswith('subscription:')
+            or (base_model_id and str(base_model_id).startswith('subscription:'))
+        ):
+            from open_webui.subscriptions.manager import subscription_manager
+
+            from open_webui.subscriptions.controls import (
+                filter_subscription_defaults,
+                is_valid_reasoning_effort_shape,
+            )
+
+            # Apply custom model parameters and system prompt for aliases and base models
+            if not bypass_system_prompt:
+                model_info = await Models.get_model_by_id(form_data['model'])
+                if model_info and model_info.params:
+                    params_dict = filter_subscription_defaults(model_info.params.model_dump())
+                    system = params_dict.get('system')
+                    if system:
+                        form_data = await apply_system_prompt_to_body(system, form_data, metadata, user)
+                    user_params = form_data.get('params') if isinstance(form_data.get('params'), dict) else {}
+                    for p_key, p_val in params_dict.items():
+                        if (
+                            p_val is not None
+                            and p_key not in form_data
+                            and p_key not in user_params
+                            and p_key != 'system'
+                        ):
+                            if p_key == 'reasoning_effort':
+                                if is_valid_reasoning_effort_shape(p_val):
+                                    form_data[p_key] = str(p_val).strip()
+                                continue
+                            form_data[p_key] = p_val
+
+                request.state.bypass_system_prompt = True
+
+            sub_payload = dict(form_data)
+            if base_model_id and str(base_model_id).startswith('subscription:'):
+                sub_payload['model'] = str(base_model_id)
+
+            return await subscription_manager.generate_chat_completion(
+                request=request,
+                form_data=sub_payload,
+                user=user,
+            )
         if model.get('owned_by') == 'ollama':
             # Apply before Ollama conversion so tool follow-ups keep the model system prompt
             if not bypass_system_prompt:

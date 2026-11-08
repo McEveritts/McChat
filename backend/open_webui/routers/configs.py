@@ -4,7 +4,7 @@ import logging
 from typing import Any, Optional
 
 import aiohttp
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from mcp.shared.auth import OAuthMetadata
 from open_webui.config import BannerModel
 from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, AIOHTTP_CLIENT_TIMEOUT, ENABLE_TOOL_SERVERS
@@ -97,17 +97,85 @@ class ImportConfigForm(BaseModel):
 
 @router.post('/import', response_model=dict)
 async def import_config(request: Request, form_data: ImportConfigForm, user=Depends(get_admin_user)):
+    from fastapi import HTTPException, status
     from open_webui.utils.mfa import update_mfa_config
 
-    await update_mfa_config(request, form_data.config)
+    caller_id = getattr(user, 'id', None)
+    if hasattr(Config, 'get'):
+        owner_id = str(await Config.get('subscriptions.owner_id', '') or '').strip()
+    else:
+        all_cfg = await Config.get_all()
+        owner_id = str(all_cfg.get('subscriptions.owner_id', '') or '').strip()
+    is_owner = bool(owner_id and caller_id and caller_id == owner_id)
+
+    # Check for subscription namespace mutations in incoming config
+    sub_keys = []
+    sanitized_config = {}
+    if isinstance(form_data.config, dict):
+        for k, v in form_data.config.items():
+            lower_k = str(k).strip().lower()
+            if (
+                lower_k == 'subscriptions'
+                or lower_k.startswith('subscriptions.')
+                or lower_k.startswith('subscriptions_')
+                or lower_k in (
+                    'enable_subscriptions',
+                    'subscriptions_owner_id',
+                    'subscriptions_providers',
+                    'subscriptions_request_timeout',
+                )
+            ):
+                sub_keys.append(k)
+            else:
+                sanitized_config[k] = v
+    else:
+        sanitized_config = form_data.config
+
+    if sub_keys and not is_owner:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Cannot modify subscription configuration: subscription settings are restricted to the subscription owner and must be configured via /api/v1/subscriptions/config/update.',
+        )
+
+    await update_mfa_config(request, sanitized_config)
     await publish_event(
         request,
         EVENTS.CONFIG_IMPORTED,
         actor=user,
         subject_id='import',
-        data={'keys': list(form_data.config.keys())},
+        data={'keys': list(sanitized_config.keys())},
     )
-    return await Config.get_all()
+    all_configs = await Config.get_all()
+    if sub_keys:
+        all_configs['_subscription_notice'] = (
+            'Subscription configuration keys cannot be modified via generic import and were ignored. '
+            'Use /api/v1/subscriptions/config/update.'
+        )
+    if is_owner:
+        return all_configs
+
+    sanitized = {}
+    for k, v in all_configs.items():
+        lower_k = str(k).lower()
+        if lower_k in ('subscriptions.owner_id', 'subscriptions_owner_id'):
+            continue
+        elif lower_k in ('subscriptions.providers', 'subscriptions_providers'):
+            if isinstance(v, dict):
+                sanitized_p = {}
+                for pid, pdata in v.items():
+                    if isinstance(pdata, dict):
+                        p_copy = dict(pdata)
+                        p_copy['binary_path'] = ''
+                        p_copy['config_dir'] = ''
+                        sanitized_p[pid] = p_copy
+                    else:
+                        sanitized_p[pid] = pdata
+                sanitized[k] = sanitized_p
+            else:
+                continue
+        else:
+            sanitized[k] = v
+    return sanitized
 
 
 # Export Config
@@ -115,12 +183,76 @@ async def import_config(request: Request, form_data: ImportConfigForm, user=Depe
 
 @router.get('/export', response_model=dict)
 async def export_config(user=Depends(get_admin_user)):
-    return await Config.get_all()
+    data = await Config.get_all()
+    caller_id = getattr(user, 'id', None)
+    if hasattr(Config, 'get'):
+        owner_id = str(await Config.get('subscriptions.owner_id', '') or '').strip()
+    else:
+        owner_id = str(data.get('subscriptions.owner_id', '') or '').strip()
+
+    if owner_id and caller_id and caller_id == owner_id:
+        return data
+
+    sanitized = {}
+    for k, v in data.items():
+        lower_k = str(k).lower()
+        if lower_k in ('subscriptions.owner_id', 'subscriptions_owner_id'):
+            continue
+        elif lower_k in ('subscriptions.providers', 'subscriptions_providers'):
+            if isinstance(v, dict):
+                sanitized_p = {}
+                for pid, pdata in v.items():
+                    if isinstance(pdata, dict):
+                        p_copy = dict(pdata)
+                        p_copy['binary_path'] = ''
+                        p_copy['config_dir'] = ''
+                        sanitized_p[pid] = p_copy
+                    else:
+                        sanitized_p[pid] = pdata
+                sanitized[k] = sanitized_p
+            else:
+                continue
+        else:
+            sanitized[k] = v
+    return sanitized
 
 
 @router.get('/namespace/{namespace}', response_model=dict)
 async def get_config_namespace(namespace: str, user=Depends(get_admin_user)):
-    return await Config.get_namespace(namespace)
+    data = await Config.get_namespace(namespace)
+    if any(str(key).lower().startswith('subscriptions.') for key in data):
+        caller_id = getattr(user, 'id', None)
+        if hasattr(Config, 'get'):
+            owner_id = str(await Config.get('subscriptions.owner_id', '') or '').strip()
+        else:
+            owner_id = str(data.get('subscriptions.owner_id', '') or '').strip()
+
+        if owner_id and caller_id and caller_id == owner_id:
+            return data
+
+        sanitized = {}
+        for k, v in data.items():
+            lower_k = str(k).lower()
+            if lower_k in ('subscriptions.owner_id', 'subscriptions_owner_id'):
+                continue
+            elif lower_k in ('subscriptions.providers', 'subscriptions_providers'):
+                if isinstance(v, dict):
+                    sanitized_p = {}
+                    for pid, pdata in v.items():
+                        if isinstance(pdata, dict):
+                            p_copy = dict(pdata)
+                            p_copy['binary_path'] = ''
+                            p_copy['config_dir'] = ''
+                            sanitized_p[pid] = p_copy
+                        else:
+                            sanitized_p[pid] = pdata
+                    sanitized[k] = sanitized_p
+                else:
+                    continue
+            else:
+                sanitized[k] = v
+        return sanitized
+    return data
 
 
 class InterfaceVisibilityForm(BaseModel):

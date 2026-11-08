@@ -20,8 +20,16 @@
 	import OpenAIConnection from './Connections/OpenAIConnection.svelte';
 	import AddConnectionModal from '$lib/components/AddConnectionModal.svelte';
 	import OllamaConnection from './Connections/OllamaConnection.svelte';
+	import SubscriptionConnection from './Connections/SubscriptionConnection.svelte';
 	import AdminSettingRow from './AdminSettingRow.svelte';
 	import AdminSettingSection from './AdminSettingSection.svelte';
+	import {
+		getSubscriptionsConfig,
+		updateSubscriptionsConfig,
+		getSubscriptionProviders,
+		type SubscriptionProviderStatus,
+		type SubscriptionsConfig
+	} from '$lib/apis/subscriptions';
 
 	const i18n: any = getContext('i18n');
 
@@ -45,6 +53,8 @@
 
 	let ENABLE_OPENAI_API: null | boolean = null;
 	let ENABLE_OLLAMA_API: null | boolean = null;
+	let subscriptionsConfig: SubscriptionsConfig | null = null;
+	let subscriptionProviders: SubscriptionProviderStatus[] = [];
 
 	let connectionsConfig: any = null;
 
@@ -52,6 +62,7 @@
 	let showAddOpenAIConnectionModal = false;
 	let showAddOllamaConnectionModal = false;
 	let modelListRefreshing = false;
+	let savingSubscriptions = false;
 
 	const updateOpenAIHandler = async () => {
 		if (ENABLE_OPENAI_API !== null) {
@@ -106,6 +117,66 @@
 			if (res) {
 				toast.success($i18n.t('Ollama API settings updated'));
 				await models.set(await getModels());
+			}
+		}
+	};
+
+	let initialSubscriptionsSnapshot = '';
+
+	let refreshingSubscriptionsAuth = false;
+	const refreshSubscriptionsAuthHandler = async () => {
+		if (refreshingSubscriptionsAuth) return;
+		refreshingSubscriptionsAuth = true;
+		try {
+			await models.set(await getModels());
+			if (
+				subscriptionsConfig &&
+				subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID &&
+				subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID === subscriptionsConfig.current_user_id
+			) {
+				subscriptionProviders = (await getSubscriptionProviders(localStorage.token)) || [];
+			}
+		} catch (error) {
+			console.error('Failed to refresh subscription auth state/models:', error);
+		} finally {
+			refreshingSubscriptionsAuth = false;
+		}
+	};
+
+	const updateSubscriptionsHandler = async () => {
+		if (subscriptionsConfig !== null && !savingSubscriptions) {
+			if (
+				subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID &&
+				subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID !== subscriptionsConfig.current_user_id
+			) {
+				return;
+			}
+			if (subscriptionsConfig.ENABLE_SUBSCRIPTIONS && !subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID) {
+				toast.error($i18n.t('Ownership must be claimed before enabling subscription providers.'));
+				subscriptionsConfig.ENABLE_SUBSCRIPTIONS = false;
+				return;
+			}
+			const currentSnapshot = JSON.stringify(subscriptionsConfig);
+			if (initialSubscriptionsSnapshot && currentSnapshot === initialSubscriptionsSnapshot) {
+				return;
+			}
+			savingSubscriptions = true;
+			const snapshot = JSON.parse(currentSnapshot);
+			try {
+				const res = await updateSubscriptionsConfig(localStorage.token, snapshot);
+				if (res) {
+					toast.success($i18n.t('Subscription provider settings updated'));
+					await models.set(await getModels());
+					if (subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID === subscriptionsConfig.current_user_id) {
+						subscriptionProviders = (await getSubscriptionProviders(localStorage.token)) || [];
+					}
+					subscriptionsConfig = await getSubscriptionsConfig(localStorage.token);
+					initialSubscriptionsSnapshot = JSON.stringify(subscriptionsConfig);
+				}
+			} catch (error) {
+				toast.error(`${error}`);
+			} finally {
+				savingSubscriptions = false;
 			}
 		}
 	};
@@ -167,6 +238,23 @@
 				})(),
 				(async () => {
 					connectionsConfig = await getConnectionsConfig(localStorage.token);
+				})(),
+				(async () => {
+					try {
+						subscriptionsConfig = await getSubscriptionsConfig(localStorage.token);
+						if (
+							subscriptionsConfig &&
+							subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID &&
+							subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID === subscriptionsConfig.current_user_id
+						) {
+							subscriptionProviders = (await getSubscriptionProviders(localStorage.token)) || [];
+						} else {
+							subscriptionProviders = [];
+						}
+						initialSubscriptionsSnapshot = JSON.stringify(subscriptionsConfig);
+					} catch (e) {
+						console.error('Failed to load subscriptions config:', e);
+					}
 				})()
 			]);
 
@@ -212,8 +300,9 @@
 	});
 
 	const submitHandler = async () => {
-		updateOpenAIHandler();
-		updateOllamaHandler();
+		await updateOpenAIHandler();
+		await updateOllamaHandler();
+		await updateSubscriptionsHandler();
 
 		dispatch('save');
 
@@ -354,7 +443,7 @@
 							{/each}
 						</div>
 
-						<div class="mt-1 text-[0.6875rem] text-gray-400 dark:text-gray-600">
+						<div class="mt-1 text-xs text-gray-400 dark:text-gray-600">
 							{$i18n.t('settings.admin.connections.manageOllamaApiConnections.description')}
 							<a
 								class="font-normal underline hover:text-gray-700 dark:hover:text-gray-300"
@@ -367,6 +456,90 @@
 					</div>
 				{/if}
 			</AdminSettingSection>
+
+			{#if subscriptionsConfig !== null}
+				<AdminSettingSection
+					title={$i18n.t('Subscription Providers (BYOS)')}
+				>
+					{#if subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID && subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID !== subscriptionsConfig.current_user_id}
+						<div class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+							{$i18n.t('Subscription providers are owned by user')}: <span class="font-mono font-medium">{subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID}</span>. {$i18n.t('Only the registered owner can modify subscription provider settings or view CLI configurations.')}
+						</div>
+					{:else}
+						<AdminSettingRow
+							label={$i18n.t('Enable Subscription Providers')}
+							description={$i18n.t('Connect official CLI harnesses (Claude Code, OpenAI Codex) with host-owned auth.')}
+							let:labelId
+						>
+							<Switch
+								bind:state={subscriptionsConfig.ENABLE_SUBSCRIPTIONS}
+								disabled={savingSubscriptions || (!subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID && !subscriptionsConfig.ENABLE_SUBSCRIPTIONS)}
+								on:change={async () => {
+									if (subscriptionsConfig && !subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID) {
+										toast.error($i18n.t('Please claim ownership before enabling subscription providers.'));
+										subscriptionsConfig.ENABLE_SUBSCRIPTIONS = false;
+										return;
+									}
+									await updateSubscriptionsHandler();
+								}}
+								ariaLabelledbyId={labelId}
+							/>
+						</AdminSettingRow>
+
+						<AdminSettingRow
+							label={$i18n.t('Host Subscription Account Owner')}
+							description={$i18n.t('Host CLI credentials bind exclusively to an individual user account to strictly comply with provider Terms of Service (no account sharing/intermediation).')}
+							let:labelId
+						>
+							<div class="flex items-center gap-2">
+								{#if subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID}
+									<span class="rounded bg-gray-100 dark:bg-gray-800 px-2 py-1 text-xs font-mono text-gray-700 dark:text-gray-300">
+										{subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID === subscriptionsConfig.current_user_id ? $i18n.t('Your Account (Owner)') : subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID}
+									</span>
+								{:else}
+									<button
+										type="button"
+										disabled={savingSubscriptions}
+										class="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-700 transition disabled:opacity-50"
+										on:click={async () => {
+											if (subscriptionsConfig && subscriptionsConfig.current_user_id) {
+												subscriptionsConfig.SUBSCRIPTIONS_OWNER_ID = subscriptionsConfig.current_user_id;
+												await updateSubscriptionsHandler();
+											}
+										}}
+									>
+										{$i18n.t('Claim Ownership for Current User')}
+									</button>
+								{/if}
+							</div>
+						</AdminSettingRow>
+
+						{#if subscriptionsConfig.ENABLE_SUBSCRIPTIONS}
+							<div class="mt-2.5 flex flex-col gap-2">
+								{#each subscriptionProviders as provider}
+									{#if subscriptionsConfig.SUBSCRIPTIONS_PROVIDERS && subscriptionsConfig.SUBSCRIPTIONS_PROVIDERS[provider.id]}
+										<SubscriptionConnection
+											{provider}
+											bind:config={subscriptionsConfig.SUBSCRIPTIONS_PROVIDERS[provider.id]}
+										disabled={savingSubscriptions}
+											onUpdate={() => {
+												updateSubscriptionsHandler();
+											}}
+											onAuthChanged={() => {
+												refreshSubscriptionsAuthHandler();
+											}}
+										/>
+									{/if}
+								{/each}
+							</div>
+
+							<div class="mt-2 text-xs text-gray-400 dark:text-gray-500">
+								{$i18n.t('Authentication is owned by the local provider harnesses. Log in on the server terminal for Claude/Codex, or use Google Sign-in above for Gemini Antigravity. Tokens are never read or stored by McChat.')}
+							</div>
+						{/if}
+					{/if}
+				</AdminSettingSection>
+			{/if}
 
 			<AdminSettingSection
 				title={$i18n.t('settings.admin.connections.sections.userConnections.title')}

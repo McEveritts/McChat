@@ -500,6 +500,13 @@ class ModelsTable:
             stmt = stmt.filter(Model.base_model_id != None)
 
             if filter:
+                if filter.get('exclude_subscription_models'):
+                    stmt = stmt.filter(
+                        Model.id.notlike('subscription:%'),
+                        or_(Model.base_model_id.is_(None), Model.base_model_id.notlike('subscription:%')),
+                    )
+                if filter.get('excluded_model_ids'):
+                    stmt = stmt.filter(Model.id.notin_(filter['excluded_model_ids']))
                 query_key = filter.get('query')
                 if query_key:
                     stmt = stmt.filter(
@@ -610,12 +617,22 @@ class ModelsTable:
         is_admin: bool = False,
         is_base_model: bool = False,
         db: AsyncSession | None = None,
+        exclude_subscription_models: bool = False,
+        excluded_model_ids: list[str] | None = None,
     ) -> set[str]:
         """Extract unique tag names from model meta, querying only the meta column."""
         async with get_async_db_context(db) as db:
             stmt = select(Model.meta).filter(
                 Model.base_model_id.is_(None) if is_base_model else Model.base_model_id.is_not(None)
             )
+
+            if exclude_subscription_models:
+                stmt = stmt.filter(
+                    Model.id.notlike('subscription:%'),
+                    or_(Model.base_model_id.is_(None), Model.base_model_id.notlike('subscription:%')),
+                )
+            if excluded_model_ids:
+                stmt = stmt.filter(Model.id.notin_(excluded_model_ids))
 
             if not is_admin:
                 user_groups = await Groups.get_groups_by_member_id(user_id, db=db, include_inherited=True)

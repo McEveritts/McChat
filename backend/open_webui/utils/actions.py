@@ -46,6 +46,15 @@ async def chat_action(request: Request, action_id: str, form_data: dict, user: A
         raise Exception('Model not found')
     model = models[model_id]
 
+    from open_webui.subscriptions.routing import is_subscription_model
+    if is_subscription_model(model, model_id):
+        from fastapi import HTTPException, status
+        await check_model_access(user, model)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Subscription provider connections do not support custom actions.',
+        )
+
     # Availability gate — keep this route consistent with the actions a model
     # actually surfaces to the client. Executing admin-authored Function code is
     # intended; this only stops a disabled, unassigned, or access-restricted

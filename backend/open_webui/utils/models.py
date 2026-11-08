@@ -79,19 +79,42 @@ async def fetch_openai_models(request: Request, user: UserModel = None):
     return openai_response['data']
 
 
+async def fetch_subscription_models(request: Request, user: UserModel = None):
+    try:
+        from open_webui.subscriptions.manager import subscription_manager
+
+        # When queried in user context (e.g. display endpoints), filter per subscription owner.
+        # When user is None (internal canonical cache warmup), return canonical catalog.
+        return await subscription_manager.get_models(user=user)
+    except Exception as e:
+        log.warning('Error fetching subscription models: %s', e)
+        return []
+
+
+
 async def get_all_base_models(request: Request, user: UserModel = None):
-    config = await Config.get_many('openai.enable', 'ollama.enable')
+    config = await Config.get_many('openai.enable', 'ollama.enable', 'subscriptions.enable')
     openai_task = fetch_openai_models(request, user) if config.get('openai.enable') else asyncio.sleep(0, result=[])
     ollama_task = fetch_ollama_models(request, user) if config.get('ollama.enable') else asyncio.sleep(0, result=[])
+    subscription_task = (
+        # This catalog is stored in shared process/Redis caches. Filter only
+        # when returning it to a caller, never while populating the cache.
+        fetch_subscription_models(request, user=None)
+        if config.get('subscriptions.enable')
+        else asyncio.sleep(0, result=[])
+    )
     function_task = get_function_models(request)
 
-    openai_models, ollama_models, function_models = await asyncio.gather(openai_task, ollama_task, function_task)
+    openai_models, ollama_models, subscription_models, function_models = await asyncio.gather(
+        openai_task, ollama_task, subscription_task, function_task
+    )
 
-    return function_models + openai_models + ollama_models
+    return function_models + openai_models + ollama_models + subscription_models
 
 
 async def get_all_models(request, refresh: bool = False, user: UserModel = None):
     config = await Config.get_many(
+        'subscriptions.enable',
         'models.base_models_cache',
         'evaluation.arena.enable',
         'evaluation.arena.models',
@@ -129,6 +152,13 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                 await redis.set(BASE_MODELS_CACHE_KEY, JSONCodec.dumps(base_models))
         else:
             base_models = request.app.state.BASE_MODELS
+    else:
+        # API/Ollama caches stay intact. Subscription catalogs are small public
+        # profile metadata and can change in another worker after login/logout.
+        base_models = [model for model in base_models
+            if model.get('owned_by') != 'subscription' and not str(model.get('id', '')).startswith('subscription:')]
+        if config.get('subscriptions.enable'):
+            base_models += await fetch_subscription_models(request, user=None)
 
     # deep copy the base models to avoid modifying the original list
     models = [model.copy() for model in base_models]
@@ -199,6 +229,16 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
         base_model_lookup[model['id']] = model
 
     existing_ids = {m['id'] for m in models}
+    # Keep verified native mappings before saved names/presets replace model info.
+    native_subscription_controls = {
+        model['id']: copy.deepcopy({
+            key: value for key, value in
+            (((model.get('info') or {}).get('params') or {}).get('model_controls') or {}).items()
+            if key == 'reasoning_effort'
+        })
+        for model in models
+        if model.get('owned_by') == 'subscription' or model['id'].startswith('subscription:')
+    }
 
     for custom_model in custom_models:
         if custom_model.base_model_id is None:
@@ -381,6 +421,28 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                 elif meta.get(key) is None:
                     meta[key] = copy.deepcopy(value)
 
+    # Strictly enforce safe text chat capabilities on subscription models and aliases
+    for model in models:
+        base_id = model.get('base_model_id') or (model.get('info', {}) or {}).get('base_model_id')
+        if (
+            model.get('owned_by') == 'subscription'
+            or model.get('id', '').startswith('subscription:')
+            or (base_id and str(base_id).startswith('subscription:'))
+        ):
+            from open_webui.subscriptions.manager import SAFE_SUBSCRIPTION_CAPABILITIES
+
+            info = model.setdefault('info', {})
+            native_controls = native_subscription_controls.get(base_id or model['id'], {})
+            if native_controls:
+                params = info.setdefault('params', {})
+                params['model_controls'] = {
+                    **copy.deepcopy(native_controls), **(params.get('model_controls') or {})
+                }
+            meta = info.setdefault('meta', {})
+            meta_caps = meta.setdefault('capabilities', {})
+            for cap_k, cap_v in SAFE_SUBSCRIPTION_CAPABILITIES.items():
+                meta_caps[cap_k] = cap_v
+
     # Batch-fetch all function valves in one query to avoid N+1 DB hits
     # inside get_action_priority (previously called per action × per model).
     all_function_valves = await Functions.get_function_valves_by_ids(list(all_function_ids))
@@ -496,6 +558,22 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
 
 
 async def check_model_access(user, model, model_info=None, db=None):
+    base_model_id = model.get('base_model_id') or (model.get('info', {}) or {}).get('base_model_id')
+    if (
+        model.get('owned_by') == 'subscription'
+        or model.get('id', '').startswith('subscription:')
+        or (base_model_id and str(base_model_id).startswith('subscription:'))
+    ):
+        from open_webui.subscriptions.config import SUBSCRIPTIONS_CONFIG_KEYS
+        from open_webui.subscriptions.security import check_subscription_access
+
+        owner_id = await Config.get(SUBSCRIPTIONS_CONFIG_KEYS['SUBSCRIPTIONS_OWNER_ID'], '')
+        try:
+            check_subscription_access(user, owner_id=owner_id)
+        except Exception:
+            raise Exception('Model not found')
+        return
+
     if model.get('arena'):
         meta = model.get('info', {}).get('meta', {})
         access_grants = meta.get('access_grants', [])
@@ -560,6 +638,20 @@ async def check_model_access(user, model, model_info=None, db=None):
 
 
 async def get_filtered_models(models, user, db=None):
+    from open_webui.subscriptions.config import SUBSCRIPTIONS_CONFIG_KEYS
+
+    owner_id = await Config.get(SUBSCRIPTIONS_CONFIG_KEYS['SUBSCRIPTIONS_OWNER_ID'], '')
+    user_id = getattr(user, 'id', None) if user else None
+    is_sub_owner = bool(owner_id and user_id and user_id == owner_id)
+
+    def is_subscription_model(m: dict) -> bool:
+        base = m.get('base_model_id') or (m.get('info', {}) or {}).get('base_model_id')
+        return bool(
+            m.get('owned_by') == 'subscription'
+            or m.get('id', '').startswith('subscription:')
+            or (base and str(base).startswith('subscription:'))
+        )
+
     # Filter out models that the user does not have access to
     if (
         user.role == 'user' or (user.role == 'admin' and not BYPASS_ADMIN_ACCESS_CONTROL)
@@ -600,6 +692,11 @@ async def get_filtered_models(models, user, db=None):
                     filtered_models.append(model)
                 continue
 
+            if is_subscription_model(model):
+                if is_sub_owner:
+                    filtered_models.append(model)
+                continue
+
             model_info = model_infos.get(model['id'])
             if model_info:
                 if (
@@ -615,4 +712,13 @@ async def get_filtered_models(models, user, db=None):
 
         return filtered_models
     else:
-        return models
+        # Generic ACL bypass active (e.g. admin bypass or BYPASS_MODEL_ACCESS_CONTROL).
+        # Subscription models MUST still be filtered strictly to the designated owner.
+        bypass_filtered = []
+        for model in models:
+            if is_subscription_model(model):
+                if is_sub_owner:
+                    bypass_filtered.append(model)
+            else:
+                bypass_filtered.append(model)
+        return bypass_filtered
